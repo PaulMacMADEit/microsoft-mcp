@@ -1,4 +1,5 @@
 import os
+import sys
 import msal
 import pathlib as pl
 from typing import NamedTuple
@@ -55,7 +56,12 @@ def get_token(account_id: str | None = None) -> str:
 
     if account_id:
         account = next(
-            (a for a in accounts if a["home_account_id"] == account_id), None
+            (
+                a
+                for a in accounts
+                if a["home_account_id"] == account_id or a["username"] == account_id
+            ),
+            None,
         )
     elif accounts:
         account = accounts[0]
@@ -73,7 +79,8 @@ def get_token(account_id: str | None = None) -> str:
             flow.get("verification_url", "https://microsoft.com/devicelogin"),
         )
         print(
-            f"\nTo authenticate:\n1. Visit {verification_uri}\n2. Enter code: {flow['user_code']}"
+            f"\nTo authenticate:\n1. Visit {verification_uri}\n2. Enter code: {flow['user_code']}",
+            file=sys.stderr,
         )
         result = app.acquire_token_by_device_flow(flow)
 
