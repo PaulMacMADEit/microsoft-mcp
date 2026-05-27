@@ -1,11 +1,99 @@
 import base64
 import datetime as dt
 import pathlib as pl
+import re
 from typing import Any
 from fastmcp import FastMCP
 from . import graph, auth
 
 mcp = FastMCP("microsoft-mcp")
+
+_HTML_TAG_RE = re.compile(r"<(html|body|p|br|div|span|ul|ol|li|table|h[1-6]|b|i|u|a|strong|em|hr|pre|code|blockquote)\b", re.IGNORECASE)
+
+_SIGNATURE_LOGO_PATH = pl.Path("/Users/paul/Documents/Sync/Brand/variablegrid-logo.png")
+_SIGNATURE_LOGO_CID = "variablegrid-logo"
+
+_SIGNATURE_HTML = f"""<div style="font-family: Calibri, Arial, sans-serif; font-size: 11pt; color: #1f1f1f;">
+<p style="margin:0 0 6pt 0;">Warm Regards,</p>
+<p style="margin:0;"><b>Paul McLaughlin</b></p>
+<p style="margin:6pt 0;"><img src="cid:{_SIGNATURE_LOGO_CID}" alt="Variable Grid" style="height:52px;"></p>
+<p style="margin:0;"><b>Variablegrid Adaptive Power Inc.</b></p>
+<p style="margin:0;">Email: <a href="mailto:pmclaughlin@variablegrid.com">pmclaughlin@variablegrid.com</a></p>
+</div>"""
+
+_SIGNATURE_PLAIN = """Warm Regards,
+
+Paul McLaughlin
+
+Variablegrid Adaptive Power Inc.
+Email: pmclaughlin@variablegrid.com"""
+
+
+def _email_body(content: str) -> dict[str, str]:
+    """Build a Graph message body, auto-detecting HTML vs plain text."""
+    content_type = "HTML" if _HTML_TAG_RE.search(content) else "Text"
+    return {"contentType": content_type, "content": content}
+
+
+def _strip_existing_signoff(body: str, is_html: bool) -> str:
+    """Remove a trailing 'Best,/Warm Regards,/Thanks,/Paul' block so we don't double-sign."""
+    if is_html:
+        # Strip trailing <p>...sign-off...</p> blocks containing Paul + a closer
+        pattern = re.compile(
+            r"(<p[^>]*>\s*(Warm Regards|Best|Thanks|Cheers)[,\s]*<br\s*/?>\s*Paul[\s\S]*?</p>\s*)+\s*$",
+            re.IGNORECASE,
+        )
+        return pattern.sub("", body).rstrip()
+    pattern = re.compile(
+        r"\n\s*(Warm Regards|Best|Thanks|Cheers)\s*,\s*\n\s*Paul\s*$",
+        re.IGNORECASE,
+    )
+    return pattern.sub("", body).rstrip()
+
+
+def _apply_signature(body: str) -> tuple[str, list[dict[str, Any]]]:
+    """Append Paul's signature to body. Returns (new_body, inline_attachments).
+
+    For HTML bodies, embeds the logo as an inline cid: image and returns the
+    Graph file-attachment dict so the caller can attach it to the message.
+    For plain-text bodies, appends the plain-text signature with no logo.
+    """
+    is_html = bool(_HTML_TAG_RE.search(body))
+    body = _strip_existing_signoff(body, is_html)
+
+    if not is_html:
+        return f"{body}\n\n{_SIGNATURE_PLAIN}", []
+
+    # Insert signature before </body> if present, otherwise append
+    if re.search(r"</body>\s*</html>\s*$", body, re.IGNORECASE):
+        new_body = re.sub(
+            r"(</body>\s*</html>\s*)$",
+            f"{_SIGNATURE_HTML}\\1",
+            body,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+    elif re.search(r"</body>\s*$", body, re.IGNORECASE):
+        new_body = re.sub(
+            r"(</body>\s*)$", f"{_SIGNATURE_HTML}\\1", body, count=1, flags=re.IGNORECASE
+        )
+    else:
+        new_body = f"{body}\n{_SIGNATURE_HTML}"
+
+    inline_attachments: list[dict[str, Any]] = []
+    if _SIGNATURE_LOGO_PATH.exists():
+        logo_bytes = _SIGNATURE_LOGO_PATH.read_bytes()
+        inline_attachments.append(
+            {
+                "@odata.type": "#microsoft.graph.fileAttachment",
+                "name": _SIGNATURE_LOGO_PATH.name,
+                "contentType": "image/png",
+                "contentBytes": base64.b64encode(logo_bytes).decode("utf-8"),
+                "contentId": _SIGNATURE_LOGO_CID,
+                "isInline": True,
+            }
+        )
+    return new_body, inline_attachments
 
 FOLDERS = {
     k.casefold(): v
@@ -217,13 +305,22 @@ def create_email_draft(
     body: str,
     cc: str | list[str] | None = None,
     attachments: str | list[str] | None = None,
+    append_signature: bool = True,
 ) -> dict[str, Any]:
-    """Create an email draft with file path(s) as attachments"""
+    """Create an email draft with file path(s) as attachments.
+
+    append_signature (default True): appends Paul's "Warm Regards" sign-off,
+    embedding the variablegrid logo as an inline image when the body is HTML.
+    """
     to_list = [to] if isinstance(to, str) else to
+
+    inline_attachments: list[dict[str, Any]] = []
+    if append_signature:
+        body, inline_attachments = _apply_signature(body)
 
     message = {
         "subject": subject,
-        "body": {"contentType": "Text", "content": body},
+        "body": _email_body(body),
         "toRecipients": [{"emailAddress": {"address": addr}} for addr in to_list],
     }
 
@@ -233,7 +330,7 @@ def create_email_draft(
             {"emailAddress": {"address": addr}} for addr in cc_list
         ]
 
-    small_attachments = []
+    small_attachments = list(inline_attachments)
     large_attachments = []
 
     if attachments:
@@ -293,13 +390,22 @@ def send_email(
     body: str,
     cc: str | list[str] | None = None,
     attachments: str | list[str] | None = None,
+    append_signature: bool = True,
 ) -> dict[str, str]:
-    """Send an email immediately with file path(s) as attachments"""
+    """Send an email immediately with file path(s) as attachments.
+
+    append_signature (default True): appends Paul's "Warm Regards" sign-off,
+    embedding the variablegrid logo as an inline image when the body is HTML.
+    """
     to_list = [to] if isinstance(to, str) else to
+
+    inline_attachments: list[dict[str, Any]] = []
+    if append_signature:
+        body, inline_attachments = _apply_signature(body)
 
     message = {
         "subject": subject,
-        "body": {"contentType": "Text", "content": body},
+        "body": _email_body(body),
         "toRecipients": [{"emailAddress": {"address": addr}} for addr in to_list],
     }
 
@@ -337,7 +443,7 @@ def send_email(
                 has_large_attachments = True
 
     if not has_large_attachments and processed_attachments:
-        message["attachments"] = [
+        message["attachments"] = list(inline_attachments) + [
             {
                 "@odata.type": "#microsoft.graph.fileAttachment",
                 "name": att["name"],
@@ -353,7 +459,7 @@ def send_email(
         to_list = [to] if isinstance(to, str) else to
         message = {
             "subject": subject,
-            "body": {"contentType": "Text", "content": body},
+            "body": _email_body(body),
             "toRecipients": [{"emailAddress": {"address": addr}} for addr in to_list],
         }
         if cc:
@@ -361,6 +467,8 @@ def send_email(
             message["ccRecipients"] = [
                 {"emailAddress": {"address": addr}} for addr in cc_list
             ]
+        if inline_attachments:
+            message["attachments"] = list(inline_attachments)
 
         result = graph.request("POST", "/me/messages", account_id, json=message)
         if not result:
@@ -395,6 +503,8 @@ def send_email(
         graph.request("POST", f"/me/messages/{message_id}/send", account_id)
         return {"status": "sent"}
     else:
+        if inline_attachments:
+            message["attachments"] = list(inline_attachments)
         graph.request("POST", "/me/sendMail", account_id, json={"message": message})
         return {"status": "sent"}
 
@@ -457,7 +567,7 @@ def move_email(
 def reply_to_email(account_id: str, email_id: str, body: str) -> dict[str, str]:
     """Reply to an email (sender only)"""
     endpoint = f"/me/messages/{email_id}/reply"
-    payload = {"message": {"body": {"contentType": "Text", "content": body}}}
+    payload = {"message": {"body": _email_body(body)}}
     graph.request("POST", endpoint, account_id, json=payload)
     return {"status": "sent"}
 
@@ -466,7 +576,7 @@ def reply_to_email(account_id: str, email_id: str, body: str) -> dict[str, str]:
 def reply_all_email(account_id: str, email_id: str, body: str) -> dict[str, str]:
     """Reply to all recipients of an email"""
     endpoint = f"/me/messages/{email_id}/replyAll"
-    payload = {"message": {"body": {"contentType": "Text", "content": body}}}
+    payload = {"message": {"body": _email_body(body)}}
     graph.request("POST", endpoint, account_id, json=payload)
     return {"status": "sent"}
 
@@ -536,7 +646,7 @@ def create_event(
         event["location"] = {"displayName": location}
 
     if body:
-        event["body"] = {"contentType": "Text", "content": body}
+        event["body"] = _email_body(body)
 
     if attendees:
         attendees_list = [attendees] if isinstance(attendees, str) else attendees
@@ -572,7 +682,7 @@ def update_event(
     if "location" in updates:
         formatted_updates["location"] = {"displayName": updates["location"]}
     if "body" in updates:
-        formatted_updates["body"] = {"contentType": "Text", "content": updates["body"]}
+        formatted_updates["body"] = _email_body(updates["body"])
 
     result = graph.request(
         "PATCH", f"/me/events/{event_id}", account_id, json=formatted_updates
@@ -970,3 +1080,103 @@ def unified_search(
             results.setdefault("other", []).append(item)
 
     return {k: v for k, v in results.items() if v}
+
+
+@mcp.tool
+def list_chats(
+    account_id: str,
+    limit: int = 25,
+) -> list[dict[str, Any]]:
+    """List the user's Teams chats (1:1 and group), expanded with members.
+
+    Ordered by most-recent activity. Each chat includes id, topic, chatType,
+    lastUpdatedDateTime, and a members[] list with displayName + email.
+    Use the returned chat id with list_chat_messages.
+    """
+    params = {
+        "$expand": "members",
+        "$top": str(min(limit, 50)),
+        "$orderby": "lastMessagePreview/createdDateTime desc",
+    }
+    result = graph.request("GET", "/me/chats", account_id, params=params)
+    chats = (result or {}).get("value", []) if result else []
+    out = []
+    for c in chats:
+        out.append(
+            {
+                "id": c.get("id"),
+                "topic": c.get("topic"),
+                "chatType": c.get("chatType"),
+                "lastUpdatedDateTime": c.get("lastUpdatedDateTime"),
+                "webUrl": c.get("webUrl"),
+                "members": [
+                    {
+                        "displayName": m.get("displayName"),
+                        "email": m.get("email"),
+                        "userId": m.get("userId"),
+                    }
+                    for m in c.get("members", [])
+                ],
+            }
+        )
+    return out
+
+
+@mcp.tool
+def find_chat_with(
+    name_or_email: str,
+    account_id: str,
+    chat_limit: int = 50,
+) -> list[dict[str, Any]]:
+    """Find Teams chats whose members include someone matching name_or_email
+    (case-insensitive substring match on displayName or email).
+
+    Returns the same shape as list_chats, filtered. Useful before list_chat_messages.
+    """
+    needle = name_or_email.lower()
+    all_chats = list_chats(account_id, limit=chat_limit)
+    matches = []
+    for c in all_chats:
+        for m in c.get("members", []):
+            dn = (m.get("displayName") or "").lower()
+            em = (m.get("email") or "").lower()
+            if needle in dn or needle in em:
+                matches.append(c)
+                break
+    return matches
+
+
+@mcp.tool
+def list_chat_messages(
+    chat_id: str,
+    account_id: str,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """List recent messages from a Teams chat, newest first.
+
+    Returns id, createdDateTime, from (displayName + email), and body.content
+    (text/HTML). Use the chat_id from list_chats or find_chat_with.
+    """
+    params = {"$top": str(min(limit, 50))}
+    result = graph.request(
+        "GET", f"/chats/{chat_id}/messages", account_id, params=params
+    )
+    messages = (result or {}).get("value", []) if result else []
+    out = []
+    for msg in messages:
+        sender = (msg.get("from") or {}).get("user") or {}
+        out.append(
+            {
+                "id": msg.get("id"),
+                "createdDateTime": msg.get("createdDateTime"),
+                "from": {
+                    "displayName": sender.get("displayName"),
+                    "email": sender.get("email") or sender.get("userPrincipalName"),
+                },
+                "messageType": msg.get("messageType"),
+                "importance": msg.get("importance"),
+                "body": (msg.get("body") or {}).get("content"),
+                "contentType": (msg.get("body") or {}).get("contentType"),
+            }
+        )
+    return out
