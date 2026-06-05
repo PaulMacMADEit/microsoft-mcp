@@ -95,6 +95,41 @@ def _apply_signature(body: str) -> tuple[str, list[dict[str, Any]]]:
         )
     return new_body, inline_attachments
 
+
+def _file_attachment(
+    file_path: str, content_id: str | None = None, inline: bool = False
+) -> dict[str, Any]:
+    """Build a Graph fileAttachment dict from a path (optionally inline w/ cid)."""
+    path = pl.Path(file_path).expanduser().resolve()
+    att: dict[str, Any] = {
+        "@odata.type": "#microsoft.graph.fileAttachment",
+        "name": path.name,
+        "contentBytes": base64.b64encode(path.read_bytes()).decode("utf-8"),
+    }
+    if content_id:
+        att["contentId"] = content_id
+    if inline:
+        att["isInline"] = True
+    return att
+
+
+def _compose_reply_body(reply_body: str, quoted: str, source_is_html: bool) -> str:
+    """Combine new reply text with the quoted history a createReply produced.
+
+    For HTML threads, insert the reply *inside* the quoted <body> so the markup
+    stays valid: prepending fragments before a full <html> document yields
+    malformed HTML that a sanitizer can reflow, stripping inline cid: images.
+    For plain-text threads, just join with blank lines.
+    """
+    if source_is_html:
+        m = re.search(r"<body[^>]*>", quoted, re.IGNORECASE)
+        if m:
+            i = m.end()
+            return quoted[:i] + reply_body + "<br><br>" + quoted[i:]
+        return reply_body + "<br><br>" + quoted
+    return reply_body + "\n\n" + quoted
+
+
 FOLDERS = {
     k.casefold(): v
     for k, v in {
@@ -579,6 +614,103 @@ def reply_all_email(account_id: str, email_id: str, body: str) -> dict[str, str]
     payload = {"message": {"body": _email_body(body)}}
     graph.request("POST", endpoint, account_id, json=payload)
     return {"status": "sent"}
+
+
+@mcp.tool
+def create_reply_draft(
+    account_id: str,
+    email_id: str,
+    body: str,
+    reply_all: bool = False,
+    attachments: str | list[str] | None = None,
+    inline_images: str | list[str] | None = None,
+    append_signature: bool = True,
+) -> dict[str, Any]:
+    """Create a DRAFT reply to an existing email, threaded into the conversation.
+
+    Unlike reply_to_email / reply_all_email (which send immediately with no
+    attachments), this leaves a draft for review and supports file attachments
+    and inline images. The quoted thread history is preserved.
+
+    inline_images: file path(s) embedded inline in the body. Reference each in
+    the HTML body as <img src="cid:NAME"> where NAME is the image file's stem
+    (an image at /tmp/panel.png is referenced as <img src="cid:panel">).
+
+    append_signature (default True): appends Paul's sign-off (+ logo for HTML).
+
+    Note: the reply inherits the original message's content type. Replying to a
+    plain-text message yields a plain-text draft, so HTML formatting and inline
+    images will not render; reply to an HTML message for rich formatting.
+    """
+    endpoint = (
+        f"/me/messages/{email_id}/{'createReplyAll' if reply_all else 'createReply'}"
+    )
+    draft = graph.request("POST", endpoint, account_id)
+    if not draft:
+        raise ValueError("Failed to create reply draft")
+    draft_id = draft["id"]
+    quoted = draft.get("body", {}).get("content", "")
+    source_is_html = (
+        draft.get("body", {}).get("contentType", "html").lower() == "html"
+    )
+
+    inline_atts: list[dict[str, Any]] = []
+    if append_signature:
+        body, inline_atts = _apply_signature(body)
+    full_body = _compose_reply_body(body, quoted, source_is_html)
+
+    if inline_images:
+        paths = [inline_images] if isinstance(inline_images, str) else inline_images
+        for p in paths:
+            inline_atts.append(
+                _file_attachment(p, content_id=pl.Path(p).stem, inline=True)
+            )
+
+    # Attach inline images BEFORE setting the body so the cid: refs resolve and
+    # aren't stripped by the sanitizer.
+    for att in inline_atts:
+        graph.request(
+            "POST", f"/me/messages/{draft_id}/attachments", account_id, json=att
+        )
+
+    # Set the composed body, preserving the source content type (a text-sourced
+    # reply can't be promoted to HTML).
+    graph.request(
+        "PATCH",
+        f"/me/messages/{draft_id}",
+        account_id,
+        json={
+            "body": {
+                "contentType": "HTML" if source_is_html else "Text",
+                "content": full_body,
+            }
+        },
+    )
+
+    # Regular file attachments (large ones go via an upload session).
+    if attachments:
+        att_paths = [attachments] if isinstance(attachments, str) else attachments
+        for file_path in att_paths:
+            path = pl.Path(file_path).expanduser().resolve()
+            content_bytes = path.read_bytes()
+            if len(content_bytes) < 3 * 1024 * 1024:
+                graph.request(
+                    "POST",
+                    f"/me/messages/{draft_id}/attachments",
+                    account_id,
+                    json=_file_attachment(file_path),
+                )
+            else:
+                graph.upload_large_mail_attachment(
+                    draft_id,
+                    path.name,
+                    content_bytes,
+                    account_id,
+                    "application/octet-stream",
+                )
+
+    result = graph.request("GET", f"/me/messages/{draft_id}", account_id)
+    return result if result else {"id": draft_id, "status": "draft"}
 
 
 @mcp.tool
@@ -1180,3 +1312,34 @@ def list_chat_messages(
             }
         )
     return out
+
+
+@mcp.tool
+def send_chat_message(
+    chat_id: str,
+    message: str,
+    account_id: str,
+) -> dict[str, Any]:
+    """Send a message to a Teams chat (1:1 or group).
+
+    Use the chat_id from list_chats or find_chat_with. Content type is
+    auto-detected: HTML if the message contains HTML tags, otherwise plain
+    text (newlines preserved). Uses the Chat.ReadWrite scope already on the
+    token.
+
+    Returns the created message's id, createdDateTime, and webUrl.
+    Always confirm the chat's members (via find_chat_with) before sending.
+    """
+    result = graph.request(
+        "POST",
+        f"/chats/{chat_id}/messages",
+        account_id,
+        json={"body": _email_body(message)},
+    )
+    result = result or {}
+    return {
+        "id": result.get("id"),
+        "createdDateTime": result.get("createdDateTime"),
+        "webUrl": result.get("webUrl"),
+        "chatId": result.get("chatId") or chat_id,
+    }
