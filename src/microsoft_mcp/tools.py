@@ -1,5 +1,6 @@
 import base64
 import datetime as dt
+import html as html_mod
 import pathlib as pl
 import re
 from typing import Any
@@ -33,6 +34,22 @@ def _email_body(content: str) -> dict[str, str]:
     """Build a Graph message body, auto-detecting HTML vs plain text."""
     content_type = "HTML" if _HTML_TAG_RE.search(content) else "Text"
     return {"contentType": content_type, "content": content}
+
+
+def _chat_body(content: str) -> dict[str, str]:
+    """Build a Teams chatMessage body.
+
+    Teams renders contentType=text messages with newlines collapsed, so
+    plain text is escaped and converted to HTML with <br> line breaks.
+    Content that already contains HTML tags is passed through as HTML.
+
+    NOTE: chatMessage requires lowercase "html"/"text" — uppercase "HTML"
+    (fine for email) gets a 400 from /chats/{id}/messages.
+    """
+    if _HTML_TAG_RE.search(content):
+        return {"contentType": "html", "content": content}
+    escaped = html_mod.escape(content).replace("\n", "<br>")
+    return {"contentType": "html", "content": escaped}
 
 
 def _strip_existing_signoff(body: str, is_html: bool) -> str:
@@ -1266,7 +1283,10 @@ def find_chat_with(
     Returns the same shape as list_chats, filtered. Useful before list_chat_messages.
     """
     needle = name_or_email.lower()
-    all_chats = list_chats(account_id, limit=chat_limit)
+    # list_chats is wrapped by @mcp.tool (a FunctionTool, not callable) — call the
+    # underlying function via .fn. Without this, find_chat_with raises
+    # "'FunctionTool' object is not callable".
+    all_chats = list_chats.fn(account_id, limit=chat_limit)
     matches = []
     for c in all_chats:
         for m in c.get("members", []):
@@ -1323,9 +1343,9 @@ def send_chat_message(
     """Send a message to a Teams chat (1:1 or group).
 
     Use the chat_id from list_chats or find_chat_with. Content type is
-    auto-detected: HTML if the message contains HTML tags, otherwise plain
-    text (newlines preserved). Uses the Chat.ReadWrite scope already on the
-    token.
+    auto-detected: HTML passes through; plain text is converted to HTML
+    with <br> line breaks (Teams collapses newlines in text-type bodies).
+    Uses the Chat.ReadWrite scope already on the token.
 
     Returns the created message's id, createdDateTime, and webUrl.
     Always confirm the chat's members (via find_chat_with) before sending.
@@ -1334,7 +1354,7 @@ def send_chat_message(
         "POST",
         f"/chats/{chat_id}/messages",
         account_id,
-        json={"body": _email_body(message)},
+        json={"body": _chat_body(message)},
     )
     result = result or {}
     return {
